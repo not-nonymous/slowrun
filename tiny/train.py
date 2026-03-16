@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
 import wandb
+import numpy as np
 
 import tiktoken
 
@@ -44,6 +45,14 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
 parser.add_argument("--weight-decay", type=float, default=0.8)
+# WD follows a 3-phase schedule: hold → decay → ramp
+#   [0, wd-phase1-epoch]:          hold at --weight-decay
+#   [wd-phase1-epoch, wd-phase2-epoch]: decay to --wd-mid
+#   [wd-phase2-epoch, num-epochs]:      ramp up to --wd-end
+parser.add_argument("--wd-phase1-epoch", type=int, default=2)
+parser.add_argument("--wd-phase2-epoch", type=int, default=8)
+parser.add_argument("--wd-mid", type=float, default=0.1)
+parser.add_argument("--wd-end", type=float, default=1.25)
 parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
@@ -775,6 +784,9 @@ tokens_per_fwdbwd = args.device_batch_size * MAX_SEQ_LEN * ddp_world_size
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 num_iterations = round(TOKENS_PER_EPOCH * args.num_epochs / TOTAL_BATCH_SIZE)  # estimate for LR schedule
+# Convert epoch boundaries to steps (must happen after num_iterations is known)
+wd_phase1_end_step = round(args.wd_phase1_epoch / args.num_epochs * num_iterations)
+wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iterations)
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
@@ -827,18 +839,16 @@ while current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
-    # WD schedule: 0.8 for 2ep → decay to 0.1 by ep8 → ramp to 1.25 linearly till end
-    steps_per_epoch = num_iterations // args.num_epochs
-    wd_phase1_end = 2 * steps_per_epoch
-    wd_phase2_end = 8 * steps_per_epoch
-    if step <= wd_phase1_end:
-        wd_scale = 1.0
-    elif step <= wd_phase2_end:
-        progress = (step - wd_phase1_end) / (wd_phase2_end - wd_phase1_end)
-        wd_scale = 1.0 - 0.875 * progress  # 1.0 → 0.125 (0.8→0.1)
-    else:
-        progress = (step - wd_phase2_end) / (num_iterations - wd_phase2_end)
-        wd_scale = 0.125 + (1.5625 - 0.125) * min(progress, 1.0)  # 0.125 → 1.5625 (0.1→1.25)
+    # WD schedule:
+    #   [0, wd_phase1_end_step]:              hold at weight_decay
+    #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
+    #   [wd_phase2_end_step, num_iterations]:     ramp up to wd_end
+    wd = np.interp(step,
+        [0, wd_phase1_end_step, wd_phase2_end_step, num_iterations],
+        [args.weight_decay, args.weight_decay, args.wd_mid, args.wd_end])
+    # Convert to a scale factor;
+    # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
+    wd_scale = wd / args.weight_decay if args.weight_decay > 0 else 0.0
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if "initial_wd" not in group:
