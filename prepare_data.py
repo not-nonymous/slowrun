@@ -3,7 +3,7 @@ Preprocess FineWeb into pre-tokenized train/val splits using the GPT-2 tokenizer
 
 Usage:
     python prepare_data.py
-    python prepare_data.py --train_tokens 100_000_000 --val_tokens 10_000_000 --local_dir fineweb_data
+    python prepare_data.py --train_tokens 100_000_000 --val_tokens 10_000_000 --fitness_tokens 1_000_000 --local_dir fineweb_data
 """
 
 import os
@@ -26,6 +26,7 @@ BATCH_SIZE = 16  # device batch size, used for chunking
 EXPECTED_HASHES = {
     "fineweb_val.pt": "80e7e430d3a7d10892c2ff32579370c5b65fbe833579d7ea5d55cbd0504c8462",
     "fineweb_train.pt": "e7e089aedbccb6865ce76c78453fa473c823969846fccd4000f5f13aef54e70e",
+    "fineweb_fitness.pt": "5641d01a27725c224abd9f64f3f90ef7d8086157f070936aef712e243ff50866"
 }
 
 # -----------------------------------------------------------------------------
@@ -137,18 +138,20 @@ def verify_hash(filepath):
 # -----------------------------------------------------------------------------
 # Main
 
-def preprocess(train_tokens, val_tokens, local_dir):
+def preprocess(train_tokens, val_tokens, fitness_tokens, local_dir):
     encoder = tiktoken.get_encoding("gpt2")
 
     val_seqs = val_tokens // SEQUENCE_SIZE
     train_seqs = train_tokens // SEQUENCE_SIZE
+    fitness_seqs = fitness_tokens // SEQUENCE_SIZE
 
     print(f"{'='*60}")
     print(f"Preprocessing FineWeb with GPT-2 tokenizer")
     print(f"{'='*60}")
     print(f"Sequence length: {SEQUENCE_LENGTH} (size {SEQUENCE_SIZE})")
-    print(f"Val:   {val_tokens:>13,} raw tokens -> {val_seqs:,} sequences")
-    print(f"Train: {train_tokens:>13,} raw tokens -> {train_seqs:,} sequences")
+    print(f"Val:     {val_tokens:>13,} raw tokens -> {val_seqs:,} sequences")
+    print(f"Train:   {train_tokens:>13,} raw tokens -> {train_seqs:,} sequences")
+    print(f"Fitness: {fitness_tokens:>13,} raw tokens -> {fitness_seqs:,} sequences")
     print(f"Output: {local_dir}/")
     print(f"{'='*60}")
 
@@ -174,17 +177,28 @@ def preprocess(train_tokens, val_tokens, local_dir):
     np.random.shuffle(train_sequences)
     print(f"  {len(train_sequences):,} train sequences ({len(train_sequences) * SEQUENCE_LENGTH:,} trainable tokens)")
 
+    # Pool 3: fitness (continues from same iterator, no overlap with val or train)
+    print(f"\nTokenizing fitness ({fitness_tokens:,} tokens)...")
+    fitness_raw = tokenize_documents(dataset_iter, encoder, fitness_tokens)
+    fitness_sequences = create_sequences(fitness_raw, SEQUENCE_SIZE)
+    np.random.seed(44)
+    np.random.shuffle(fitness_sequences)
+    print(f"  {len(fitness_sequences):,} fitness sequences ({len(fitness_sequences) * SEQUENCE_LENGTH:,} trainable tokens)")
+
     # Write
     print()
     val_path = os.path.join(local_dir, "fineweb_val.pt")
     train_path = os.path.join(local_dir, "fineweb_train.pt")
+    fitness_path = os.path.join(local_dir, "fineweb_fitness.pt")
     write_datafile(val_path, val_sequences, BATCH_SIZE)
     write_datafile(train_path, train_sequences, BATCH_SIZE)
+    write_datafile(fitness_path, fitness_sequences, BATCH_SIZE)
 
     # Verify hashes
     print()
     verify_hash(val_path)
     verify_hash(train_path)
+    verify_hash(fitness_path)
 
     print(f"\nDone! Files saved to {local_dir}/")
 
@@ -193,11 +207,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess FineWeb with GPT-2 tokenizer")
     parser.add_argument("--train_tokens", type=int, default=100_000_000)
     parser.add_argument("--val_tokens", type=int, default=10_000_000)
+    parser.add_argument("--fitness_tokens", type=int, default=1_000_000)
     parser.add_argument("--local_dir", type=str, default="fineweb_data")
     args = parser.parse_args()
 
     preprocess(
         train_tokens=args.train_tokens,
         val_tokens=args.val_tokens,
+        fitness_tokens=args.fitness_tokens,
         local_dir=args.local_dir,
     )
